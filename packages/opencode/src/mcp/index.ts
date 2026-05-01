@@ -119,8 +119,25 @@ function remoteURL(key: string, value: string) {
   log.warn("invalid remote mcp url", { key })
 }
 
+function isRecoverableToolConnectionError(err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err ?? "")
+  return (
+    /\bnot connected\b/i.test(msg) ||
+    /\btransport\b.*\b(?:closed|not connected)\b/i.test(msg) ||
+    /\bsession\s*not\s*found\b/i.test(msg) ||
+    /\binvalid\s*session\b/i.test(msg) ||
+    /\bmcp-session-id\b/i.test(msg)
+  )
+}
+
 // Convert MCP tool definition to AI SDK Tool type
-function convertMcpTool(mcpTool: MCPToolDef, client: MCPClient, timeout?: number): Tool {
+function convertMcpTool(
+  mcpTool: MCPToolDef,
+  serverName: string,
+  getClient: () => MCPClient | undefined,
+  reconnect: () => Promise<MCPClient | undefined>,
+  timeout?: number,
+): Tool {
   const inputSchema = mcpTool.inputSchema
 
   // Spread first, then override type to ensure it's always "object"
@@ -135,17 +152,29 @@ function convertMcpTool(mcpTool: MCPToolDef, client: MCPClient, timeout?: number
     description: mcpTool.description ?? "",
     inputSchema: jsonSchema(schema),
     execute: async (args: unknown) => {
-      return client.callTool(
-        {
-          name: mcpTool.name,
-          arguments: (args || {}) as Record<string, unknown>,
-        },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
-          timeout,
-        },
-      )
+      const call = (client: MCPClient) =>
+        client.callTool(
+          {
+            name: mcpTool.name,
+            arguments: (args || {}) as Record<string, unknown>,
+          },
+          CallToolResultSchema,
+          {
+            resetTimeoutOnProgress: true,
+            timeout,
+          },
+        )
+
+      const initial = getClient() ?? (await reconnect())
+      if (!initial) throw new Error(`MCP server "${serverName}" is not connected`)
+
+      return call(initial).catch(async (err) => {
+        if (!isRecoverableToolConnectionError(err)) throw err
+        log.info("mcp tool connection unavailable, reconnecting", { server: serverName, tool: mcpTool.name })
+        const fresh = await reconnect()
+        if (!fresh) throw err
+        return call(fresh)
+      })
     },
   })
 }
@@ -630,6 +659,7 @@ export const layer = Layer.effect(
     const tools = Effect.fn("MCP.tools")(function* () {
       const result: Record<string, Tool> = {}
       const s = yield* InstanceState.get(state)
+      const bridge = yield* EffectBridge.make()
 
       const cfg = yield* cfgSvc.get()
       const config = cfg.mcp ?? {}
@@ -641,7 +671,7 @@ export const layer = Layer.effect(
 
       yield* Effect.forEach(
         connectedClients,
-        ([clientName, client]) =>
+        ([clientName]) =>
           Effect.gen(function* () {
             const mcpConfig = config[clientName]
             const entry = mcpConfig && isMcpConfigured(mcpConfig) ? mcpConfig : undefined
@@ -654,7 +684,27 @@ export const layer = Layer.effect(
 
             const timeout = entry?.timeout ?? defaultTimeout
             for (const mcpTool of listed) {
-              result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(mcpTool, client, timeout)
+              const getClient = () => (s.status[clientName]?.status === "connected" ? s.clients[clientName] : undefined)
+              const reconnect = async () => {
+                if (!entry) return undefined
+                try {
+                  await bridge.promise(createAndStore(clientName, entry))
+                } catch (e) {
+                  log.warn("mcp reconnect failed", {
+                    server: clientName,
+                    error: e instanceof Error ? e.message : String(e),
+                  })
+                  return undefined
+                }
+                return getClient()
+              }
+              result[sanitize(clientName) + "_" + sanitize(mcpTool.name)] = convertMcpTool(
+                mcpTool,
+                clientName,
+                getClient,
+                reconnect,
+                timeout,
+              )
             }
           }),
         { concurrency: "unbounded" },

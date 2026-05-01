@@ -12,6 +12,9 @@ interface MockClientState {
   listToolsError: string
   listPromptsShouldFail: boolean
   listResourcesShouldFail: boolean
+  callToolCalls: number
+  callToolErrors: Error[]
+  callToolResult: unknown
   prompts: Array<{ name: string; description?: string }>
   resources: Array<{ name: string; uri: string; description?: string }>
   closed: boolean
@@ -39,6 +42,9 @@ function getOrCreateClientState(name?: string): MockClientState {
       listToolsError: "listTools failed",
       listPromptsShouldFail: false,
       listResourcesShouldFail: false,
+      callToolCalls: 0,
+      callToolErrors: [],
+      callToolResult: { content: [{ type: "text", text: "ok" }] },
       prompts: [],
       resources: [],
       closed: false,
@@ -152,6 +158,13 @@ void mock.module("@modelcontextprotocol/sdk/client/index.js", () => ({
       return { resources: this._state?.resources ?? [] }
     }
 
+    async callTool() {
+      if (this._state) this._state.callToolCalls++
+      const error = this._state?.callToolErrors.shift()
+      if (error) throw error
+      return this._state?.callToolResult
+    }
+
     async close() {
       if (this._state) this._state.closed = true
     }
@@ -232,6 +245,103 @@ test(
       expect(Object.keys(toolsB).length).toBeGreaterThan(0)
       expect(serverState.listToolsCalls).toBe(1)
     }),
+  ),
+)
+
+// ========================================================================
+// Test: tool call reconnects when captured MCP client is disconnected
+// ========================================================================
+
+test(
+  "tool execute reconnects and retries once after Not connected",
+  withInstance(
+    {
+      "retry-server": {
+        type: "local",
+        command: ["echo", "test"],
+      },
+    },
+    (mcp) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "retry-server"
+        const serverState = getOrCreateClientState("retry-server")
+        serverState.callToolErrors = [new Error("Not connected")]
+
+        yield* mcp.add("retry-server", {
+          type: "local",
+          command: ["echo", "test"],
+        })
+
+        const initialClientCount = clientCreateCount
+        const tools = yield* mcp.tools()
+        const result = yield* Effect.promise(() => (tools["retry-server_test_tool"] as any).execute({}))
+
+        expect(result).toEqual({ content: [{ type: "text", text: "ok" }] })
+        expect(serverState.callToolCalls).toBe(2)
+        expect(clientCreateCount).toBe(initialClientCount + 1)
+      }),
+  ),
+)
+
+test(
+  "tool execute does not reconnect for ordinary tool errors",
+  withInstance(
+    {
+      "bad-tool-server": {
+        type: "local",
+        command: ["echo", "test"],
+      },
+    },
+    (mcp) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "bad-tool-server"
+        const serverState = getOrCreateClientState("bad-tool-server")
+        serverState.callToolErrors = [new Error("Bad request: invalid arguments")]
+
+        yield* mcp.add("bad-tool-server", {
+          type: "local",
+          command: ["echo", "test"],
+        })
+
+        const initialClientCount = clientCreateCount
+        const tools = yield* mcp.tools()
+        const result = yield* Effect.exit(Effect.promise(() => (tools["bad-tool-server_test_tool"] as any).execute({})))
+
+        expect(result._tag).toBe("Failure")
+        expect(serverState.callToolCalls).toBe(1)
+        expect(clientCreateCount).toBe(initialClientCount)
+      }),
+  ),
+)
+
+test(
+  "tool execute only retries a disconnected transport once",
+  withInstance(
+    {
+      "stuck-server": {
+        type: "local",
+        command: ["echo", "test"],
+      },
+    },
+    (mcp) =>
+      Effect.gen(function* () {
+        lastCreatedClientName = "stuck-server"
+        const serverState = getOrCreateClientState("stuck-server")
+        serverState.callToolErrors = [new Error("Not connected"), new Error("Not connected")]
+
+        yield* mcp.add("stuck-server", {
+          type: "local",
+          command: ["echo", "test"],
+        })
+
+        const initialClientCount = clientCreateCount
+        const tools = yield* mcp.tools()
+        const result = yield* Effect.exit(Effect.promise(() => (tools["stuck-server_test_tool"] as any).execute({})))
+
+        expect(result._tag).toBe("Failure")
+        expect(serverState.callToolCalls).toBe(2)
+        expect(clientCreateCount).toBe(initialClientCount + 1)
+      }),
   ),
 )
 
